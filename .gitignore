@@ -1,0 +1,11 @@
+# Obsidian plugin user data (not source code)
+data.json
+
+# Node modules (if any)
+node_modules/
+
+# IDE files
+.idea/
+.vscode/
+*.swp
+*.swo
