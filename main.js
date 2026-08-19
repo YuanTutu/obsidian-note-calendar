@@ -5,6 +5,32 @@ let Lunar, Solar, HolidayUtil;
 
 const VIEW_TYPE_CALENDAR = 'note-calendar-view';
 
+/**
+ * 防抖：在连续触发结束 ms 毫秒后才执行 fn
+ */
+function debounce(fn, ms = 400) {
+  let timer = null;
+  return function (...args) {
+    if (timer) clearTimeout(timer);
+    timer = setTimeout(() => {
+      timer = null;
+      fn.apply(this, args);
+    }, ms);
+  };
+}
+
+/**
+ * 判断 filePath 是否位于 folderPath 文件夹下
+ * 用 path === folder 或 path.startsWith(folder + '/') 替代朴素 startsWith，
+ * 避免 "日记" 误匹配 "日记本/x.md"。路径均先经 normalizePath 标准化。
+ */
+function isPathInFolder(filePath, folderPath) {
+  if (!folderPath) return true;
+  const f = normalizePath(folderPath);
+  const p = normalizePath(filePath);
+  return p === f || p.startsWith(f + '/');
+}
+
 // 默认设置
 const DEFAULT_SETTINGS = {
   startOfWeek: 0, // 0=周日, 1=周一
@@ -53,6 +79,9 @@ class CalendarModel {
     this.selectedDate.setHours(0, 0, 0, 0);
     // 笔记缓存：按日期存储笔记信息
     this.noteCache = {};
+    // 反向文件索引：path -> {path, title, ctime, mtime}
+    // 用于文件事件触发时的增量更新，避免每次都全库重扫
+    this.fileIndex = new Map();
   }
 
   /**
@@ -91,6 +120,53 @@ class CalendarModel {
    */
   hasNotesForDate(dateStr) {
     return this.noteCache[dateStr] && this.noteCache[dateStr].length > 0;
+  }
+
+  /**
+   * 从所有日期的 noteCache 中移除指定路径的笔记
+   * 同时清理因此变空的日期条目
+   */
+  removeFileFromCache(path) {
+    for (const dateStr in this.noteCache) {
+      const notes = this.noteCache[dateStr];
+      const filtered = notes.filter(n => n.path !== path);
+      if (filtered.length === 0) {
+        delete this.noteCache[dateStr];
+      } else if (filtered.length !== notes.length) {
+        this.noteCache[dateStr] = filtered;
+      }
+    }
+  }
+
+  /**
+   * 根据文件信息（创建/修改时间）将笔记加入对应日期的 noteCache
+   * 若创建日期与修改日期同一天，只记一次（type 为 created）
+   * @param {{path, title, ctime, mtime}} info
+   */
+  addFileToCache(info) {
+    const createdDateStr = this.formatDate(new Date(info.ctime));
+    const modifiedDateStr = this.formatDate(new Date(info.mtime));
+
+    if (!this.noteCache[createdDateStr]) {
+      this.noteCache[createdDateStr] = [];
+    }
+    this.noteCache[createdDateStr].push({
+      path: info.path,
+      title: info.title,
+      type: 'created'
+    });
+
+    // 创建与修改不同天才记 updated
+    if (modifiedDateStr !== createdDateStr) {
+      if (!this.noteCache[modifiedDateStr]) {
+        this.noteCache[modifiedDateStr] = [];
+      }
+      this.noteCache[modifiedDateStr].push({
+        path: info.path,
+        title: info.title,
+        type: 'updated'
+      });
+    }
   }
 
   /**
@@ -290,6 +366,19 @@ getWeekNumber(date) {
   }
 
   /**
+   * 将选中日期移动 deltaDays 天（支持负数），并同步切换视图月份
+   * 用于键盘方向键导航
+   */
+  moveSelection(deltaDays) {
+    if (!this.selectedDate) return;
+    const next = new Date(this.selectedDate.getFullYear(), this.selectedDate.getMonth(), this.selectedDate.getDate());
+    next.setDate(next.getDate() + deltaDays);
+    this.selectedDate = next;
+    this.viewYear = next.getFullYear();
+    this.viewMonth = next.getMonth() + 1;
+  }
+
+  /**
    * 判断是否是选中的日期
    */
   isSelectedDate(year, month, day) {
@@ -348,15 +437,7 @@ module.exports = class NoteCalendarPlugin extends Plugin {
     this.registerEvent(
       this.app.vault.on('create', (file) => {
         if (file.extension === 'md') {
-          console.log(`[NoteCalendar] 文件创建: ${file.path}`);
-          // 检查文件路径是否在指定文件夹下
-          if (this.settings.noteFolderPath && !file.path.startsWith(this.settings.noteFolderPath)) {
-            return;
-          }
-          // 延迟扫描，确保文件已经保存
-          setTimeout(() => {
-            this.updateTodayNote(file.path);
-          }, 500);
+          this.refreshFile(file.path);
         }
       })
     );
@@ -364,15 +445,7 @@ module.exports = class NoteCalendarPlugin extends Plugin {
     this.registerEvent(
       this.app.vault.on('modify', (file) => {
         if (file.extension === 'md') {
-          console.log(`[NoteCalendar] 文件修改: ${file.path}`);
-          // 检查文件路径是否在指定文件夹下
-          if (this.settings.noteFolderPath && !file.path.startsWith(this.settings.noteFolderPath)) {
-            return;
-          }
-          // 延迟扫描，确保文件已经保存
-          setTimeout(() => {
-            this.updateTodayNote(file.path);
-          }, 500);
+          this.refreshFile(file.path);
         }
       })
     );
@@ -381,56 +454,16 @@ module.exports = class NoteCalendarPlugin extends Plugin {
     this.registerEvent(
       this.app.vault.on('rename', (file, oldPath) => {
         if (file.extension === 'md') {
-          console.log(`[NoteCalendar] 文件重命名: ${oldPath} -> ${file.path}`);
-          // 检查文件路径是否在指定文件夹下
-          if (this.settings.noteFolderPath && !file.path.startsWith(this.settings.noteFolderPath)) {
-            return;
-          }
-          // 延迟处理，确保文件已经保存
-          setTimeout(() => {
-            this.handleFileRename(oldPath, file.path);
-          }, 500);
+          this.handleRename(oldPath, file.path);
         }
       })
     );
 
     // 监听文件删除事件
     this.registerEvent(
-      this.app.vault.on('delete', async (file) => {
+      this.app.vault.on('delete', (file) => {
         if (file.extension === 'md') {
-          console.log(`[NoteCalendar] 文件删除: ${file.path}`);
-          // 检查文件路径是否在指定文件夹下
-          if (this.settings.noteFolderPath && !file.path.startsWith(this.settings.noteFolderPath)) {
-            return;
-          }
-          
-          // 清空该文件相关日期的缓存
-          const leaves = this.app.workspace.getLeavesOfType(VIEW_TYPE_CALENDAR);
-          if (leaves.length > 0) {
-            const view = leaves[0].view;
-            if (view && view.model) {
-              const model = view.model;
-              
-              // 找到该文件相关的所有日期
-              const datesToClear = [];
-              for (const dateStr in model.noteCache) {
-                const notes = model.noteCache[dateStr];
-                if (notes.some(note => note.path === file.path)) {
-                  datesToClear.push(dateStr);
-                }
-              }
-              
-              // 清空这些日期的缓存并重新扫描
-              for (const dateStr of datesToClear) {
-                console.log(`[NoteCalendar] 清空日期 ${dateStr} 的缓存`);
-                delete model.noteCache[dateStr];
-                await this.rescanDate(model, dateStr);
-              }
-              
-              // 重新渲染
-              view.render();
-            }
-          }
+          this.handleDelete(file.path);
         }
       })
     );
@@ -484,108 +517,10 @@ module.exports = class NoteCalendarPlugin extends Plugin {
   }
 
   /**
-   * 扫描笔记并更新缓存
+   * 全量扫描笔记并重建缓存与反向索引
+   * 并行 stat 所有文件，避免大库下的顺序 IO 等待
    */
   async scanNotes() {
-    console.log('[NoteCalendar] 开始扫描笔记...');
-    const leaves = this.app.workspace.getLeavesOfType(VIEW_TYPE_CALENDAR);
-    if (leaves.length === 0) {
-      console.log('[NoteCalendar] 没有找到日历视图');
-      return;
-    }
-
-    const view = leaves[0].view;
-    if (!view || !view.model) {
-      console.log('[NoteCalendar] 没有找到日历模型');
-      return;
-    }
-
-    const model = view.model;
-    const noteCache = {};
-
-    // 获取所有markdown文件
-    const files = this.app.vault.getMarkdownFiles();
-    console.log(`[NoteCalendar] 找到 ${files.length} 个markdown文件`);
-    console.log(`[NoteCalendar] 笔记文件夹路径: "${this.settings.noteFolderPath}"`);
-
-    let processedCount = 0;
-    for (const file of files) {
-      console.log(`[NoteCalendar] 正在处理文件: ${file}`);
-      // 检查文件路径是否在指定文件夹下
-      if (this.settings.noteFolderPath && !file.path.startsWith(this.settings.noteFolderPath)) {
-        continue;
-      }
-
-      // 获取文件的创建时间和修改时间
-      const stat = await this.app.vault.adapter.stat(file.path);
-      if (!stat) continue;
-
-      const createdDate = new Date(stat.ctime);
-      const modifiedDate = new Date(stat.mtime);
-
-      // 格式化日期
-      const createdDateStr = model.formatDate(createdDate);
-      const modifiedDateStr = model.formatDate(modifiedDate);
-
-      // 获取笔记标题（使用文件名，去掉.md后缀）
-      const title = file.basename;
-
-      // 如果创建日期和修改日期在同一天，只记录创建日期
-      if (createdDateStr === modifiedDateStr) {
-        if (!noteCache[createdDateStr]) {
-          noteCache[createdDateStr] = [];
-        }
-        noteCache[createdDateStr].push({
-          path: file.path,
-          title: title,
-          type: 'created' // created 或 updated
-        });
-      } else {
-        // 记录创建日期
-        if (!noteCache[createdDateStr]) {
-          noteCache[createdDateStr] = [];
-        }
-        noteCache[createdDateStr].push({
-          path: file.path,
-          title: title,
-          type: 'created'
-        });
-
-        // 记录修改日期
-        if (!noteCache[modifiedDateStr]) {
-          noteCache[modifiedDateStr] = [];
-        }
-        noteCache[modifiedDateStr].push({
-          path: file.path,
-          title: title,
-          type: 'updated'
-        });
-      }
-      processedCount++;
-    }
-
-    console.log(`[NoteCalendar] 处理了 ${processedCount} 个笔记`);
-    console.log(`[NoteCalendar] 笔记缓存日期数量: ${Object.keys(noteCache).length}`);
-    
-    // 打印缓存内容（前3个日期）
-    const dates = Object.keys(noteCache).slice(0, 3);
-    dates.forEach(date => {
-      console.log(`[NoteCalendar] 日期 ${date}: ${noteCache[date].length} 个笔记`);
-    });
-
-    // 更新模型的笔记缓存
-    model.noteCache = noteCache;
-    
-    // 重新渲染日历
-    view.render();
-    console.log('[NoteCalendar] 笔记扫描完成');
-  }
-
-  /**
-   * 更新笔记缓存（用于文件事件监听）
-   * 策略：清空相关日期的缓存，重新扫描这些日期的笔记
-   */
-  async updateTodayNote(filePath) {
     const leaves = this.app.workspace.getLeavesOfType(VIEW_TYPE_CALENDAR);
     if (leaves.length === 0) return;
 
@@ -593,181 +528,122 @@ module.exports = class NoteCalendarPlugin extends Plugin {
     if (!view || !view.model) return;
 
     const model = view.model;
-    
-    // 获取文件信息
-    const file = this.app.vault.getAbstractFileByPath(filePath);
-    if (!file) return;
+    const folder = this.settings.noteFolderPath;
 
-    // 获取文件stat
+    // 仅保留目标文件夹内的文件
+    const files = this.app.vault.getMarkdownFiles().filter(
+      f => isPathInFolder(f.path, folder)
+    );
+
+    // 并行获取 stat
+    const results = await Promise.all(
+      files.map(async (file) => {
+        try {
+          const stat = await this.app.vault.adapter.stat(file.path);
+          if (!stat) return null;
+          return { path: file.path, title: file.basename, ctime: stat.ctime, mtime: stat.mtime };
+        } catch (e) {
+          return null;
+        }
+      })
+    );
+
+    // 重建索引与缓存
+    model.noteCache = {};
+    model.fileIndex = new Map();
+    for (const info of results) {
+      if (!info) continue;
+      model.fileIndex.set(info.path, info);
+      model.addFileToCache(info);
+    }
+
+    view.render();
+  }
+
+  /**
+   * 增量刷新单个文件：更新 fileIndex 与 noteCache，然后重渲染
+   * 用于 create/modify 事件。若文件不在目标文件夹内则从索引移除。
+   */
+  async refreshFile(filePath) {
+    const leaves = this.app.workspace.getLeavesOfType(VIEW_TYPE_CALENDAR);
+    if (leaves.length === 0) return;
+    const view = leaves[0].view;
+    if (!view || !view.model) return;
+    const model = view.model;
+
+    const inFolder = isPathInFolder(filePath, this.settings.noteFolderPath);
+
+    // 无论是否在文件夹内，先移除旧的缓存条目（重命名/移动出文件夹的情况）
+    model.removeFileFromCache(filePath);
+    model.fileIndex.delete(filePath);
+
+    if (!inFolder) {
+      view.render();
+      return;
+    }
+
     const stat = await this.app.vault.adapter.stat(filePath);
-    if (!stat) return;
-
-    // 获取创建日期和修改日期
-    const fileCreatedDate = new Date(stat.ctime);
-    const fileCreatedDateStr = model.formatDate(fileCreatedDate);
-
-    const fileModifiedDate = new Date(stat.mtime);
-    const fileModifiedDateStr = model.formatDate(fileModifiedDate);
-    
-    console.log(`[NoteCalendar] 更新笔记缓存，文件: ${filePath}`);
-    console.log(`[NoteCalendar] 创建日期: ${fileCreatedDateStr}, 修改日期: ${fileModifiedDateStr}`);
-    
-    // 收集需要更新的日期（去重）
-    const datesToUpdate = new Set();
-    datesToUpdate.add(fileCreatedDateStr);
-    if (fileModifiedDateStr !== fileCreatedDateStr) {
-      datesToUpdate.add(fileModifiedDateStr);
+    if (!stat) {
+      view.render();
+      return;
     }
-    
-    // 更新每个日期的缓存
-    for (const dateStr of datesToUpdate) {
-      // 清空该日期的缓存
-      if (model.noteCache[dateStr]) {
-        console.log(`[NoteCalendar] 清空日期 ${dateStr} 的缓存`);
-        delete model.noteCache[dateStr];
-      }
-      
-      // 重新扫描该日期的笔记
-      await this.rescanDate(model, dateStr);
-    }
-    
-    // 重新渲染
+
+    const info = { path: filePath, title: filePath.split('/').pop().replace(/\.md$/i, ''), ctime: stat.ctime, mtime: stat.mtime };
+    model.fileIndex.set(filePath, info);
+    model.addFileToCache(info);
     view.render();
   }
-  
-  /**
-   * 重新扫描指定日期的笔记
-   */
-  async rescanDate(model, dateStr) {
-    console.log(`[NoteCalendar] 重新扫描日期: ${dateStr}`);
-    
-    // 解析日期
-    const [year, month, day] = dateStr.split('-').map(n => parseInt(n));
-    const targetDate = new Date(year, month - 1, day);
-    const targetDateStart = new Date(year, month - 1, day, 0, 0, 0, 0);
-    const targetDateEnd = new Date(year, month - 1, day, 23, 59, 59, 999);
-    
-    // 获取所有 Markdown 文件
-    const files = this.app.vault.getMarkdownFiles();
-    const notesForDate = [];
-    
-    for (const file of files) {
-      // 检查文件夹过滤
-      if (this.settings.noteFolderPath && !file.path.startsWith(this.settings.noteFolderPath)) {
-        continue;
-      }
-      
-      try {
-        const stat = await this.app.vault.adapter.stat(file.path);
-        if (!stat) continue;
-        
-        const createdDate = new Date(stat.ctime);
-        const modifiedDate = new Date(stat.mtime);
-        
-        // 检查创建日期是否匹配
-        const createdDateStr = model.formatDate(createdDate);
-        if (createdDateStr === dateStr) {
-          notesForDate.push({
-            path: file.path,
-            title: file.basename,
-            type: 'created'
-          });
-        }
-        
-        // 检查修改日期是否匹配（且不等于创建日期）
-        const modifiedDateStr = model.formatDate(modifiedDate);
-        if (modifiedDateStr === dateStr && createdDateStr !== dateStr) {
-          notesForDate.push({
-            path: file.path,
-            title: file.basename,
-            type: 'updated'
-          });
-        }
-      } catch (error) {
-        console.error(`[NoteCalendar] 处理文件 ${file.path} 时出错:`, error);
-      }
-    }
-    
-    // 如果找到笔记，添加到缓存
-    if (notesForDate.length > 0) {
-      model.noteCache[dateStr] = notesForDate;
-      console.log(`[NoteCalendar] 日期 ${dateStr} 找到 ${notesForDate.length} 个笔记`);
-    } else {
-      // 没有找到笔记，删除缓存条目
-      if (model.noteCache[dateStr]) {
-        delete model.noteCache[dateStr];
-        console.log(`[NoteCalendar] 日期 ${dateStr} 没有找到笔记，已删除缓存`);
-      } else {
-        console.log(`[NoteCalendar] 日期 ${dateStr} 没有找到笔记`);
-      }
-    }
-  }
 
   /**
-   * 处理文件重命名
-   * 策略：清空相关日期的缓存，重新扫描这些日期的笔记
+   * 处理文件重命名：复用旧条目的 ctime/mtime（重命名不改文件时间），
+   * 用新路径计算标题，避免依赖 adapter.stat 在 rename 事件瞬间的时序问题
    */
-  async handleFileRename(oldPath, newPath) {
-    console.log(`[NoteCalendar] 处理文件重命名: ${oldPath} -> ${newPath}`);
-    
+  async handleRename(oldPath, newPath) {
     const leaves = this.app.workspace.getLeavesOfType(VIEW_TYPE_CALENDAR);
     if (leaves.length === 0) return;
-
     const view = leaves[0].view;
     if (!view || !view.model) return;
-
     const model = view.model;
-    
-    // 获取新文件信息
-    const newFile = this.app.vault.getAbstractFileByPath(newPath);
-    if (!newFile) return;
 
-    // 获取文件stat
-    const stat = await this.app.vault.adapter.stat(newPath);
-    if (!stat) return;
+    // 取旧条目以保留不变的创建/修改时间
+    const oldInfo = model.fileIndex.get(oldPath);
+    // 清掉旧路径的缓存与索引
+    model.removeFileFromCache(oldPath);
+    model.fileIndex.delete(oldPath);
 
-    // 确定需要重新扫描的日期
-    const createdDate = new Date(stat.ctime);
-    const modifiedDate = new Date(stat.mtime);
-    const createdDateStr = model.formatDate(createdDate);
-    const modifiedDateStr = model.formatDate(modifiedDate);
-    
-    console.log(`[NoteCalendar] 文件创建日期: ${createdDateStr}, 修改日期: ${modifiedDateStr}`);
-    
-    // 收集需要重新扫描的日期
-    const datesToRescan = new Set();
-    
-    // 检查旧路径是否在缓存中
-    for (const dateStr in model.noteCache) {
-      const notes = model.noteCache[dateStr];
-      if (notes.some(note => note.path === oldPath)) {
-        datesToRescan.add(dateStr);
-        console.log(`[NoteCalendar] 添加到重新扫描列表: ${dateStr}`);
+    if (oldInfo) {
+      // 直接用旧时间 + 新路径/新标题重建，不依赖 stat
+      const newInfo = {
+        path: newPath,
+        title: newPath.split('/').pop().replace(/\.md$/i, ''),
+        ctime: oldInfo.ctime,
+        mtime: oldInfo.mtime
+      };
+      // 仅当新路径仍在目标文件夹内才加入缓存（处理移动出文件夹的情况）
+      if (isPathInFolder(newPath, this.settings.noteFolderPath)) {
+        model.fileIndex.set(newPath, newInfo);
+        model.addFileToCache(newInfo);
       }
+      view.render();
+    } else {
+      // 旧条目不在索引中（scanNotes 未运行或原本不在文件夹内），回退到 stat 刷新
+      await this.refreshFile(newPath);
     }
-    
-    // 新文件的日期也要重新扫描
-    datesToRescan.add(createdDateStr);
-    if (modifiedDateStr !== createdDateStr) {
-      datesToRescan.add(modifiedDateStr);
-    }
-    
-    // 清空这些日期的缓存
-    datesToRescan.forEach(dateStr => {
-      if (model.noteCache[dateStr]) {
-        delete model.noteCache[dateStr];
-        console.log(`[NoteCalendar] 清空日期 ${dateStr} 的缓存`);
-      }
-    });
-    
-    // 重新扫描这些日期
-    for (const dateStr of datesToRescan) {
-      await this.rescanDate(model, dateStr);
-    }
-    
-    // 重新渲染视图
+  }
+
+  /**
+   * 处理文件删除：从索引和缓存移除，然后重渲染
+   */
+  handleDelete(filePath) {
+    const leaves = this.app.workspace.getLeavesOfType(VIEW_TYPE_CALENDAR);
+    if (leaves.length === 0) return;
+    const view = leaves[0].view;
+    if (!view || !view.model) return;
+    const model = view.model;
+
+    model.removeFileFromCache(filePath);
+    model.fileIndex.delete(filePath);
     view.render();
-    console.log(`[NoteCalendar] 文件重命名处理完成`);
   }
 
   async onunload() {
@@ -822,6 +698,55 @@ class CalendarView extends ItemView {
     this.header = null;
     this.grid = null;
     this.todayBtn = null; // 今天按钮引用
+    // 农历/节假日计算缓存：lunar.js 相关方法均为纯函数，按日期 key 缓存安全
+    this.dayInfoCache = new Map(); // YYYY-MM-DD -> dayInfo
+    this.monthLunarCache = new Map(); // year-month -> 农历标题字符串
+  }
+
+  /**
+   * 获取单日的农历/节日/调休信息（带缓存）
+   * lunar.js 的相关方法均为纯函数，结果按日期缓存，软上限 2000 条
+   */
+  getDayInfo(date) {
+    const key = this.model.formatDate(date);
+    if (this.dayInfoCache.has(key)) {
+      return this.dayInfoCache.get(key);
+    }
+    // 软上限：超出时清空，避免极端情况下无限增长
+    if (this.dayInfoCache.size > 2000) {
+      this.dayInfoCache.clear();
+    }
+    const solarDay = Solar.fromDate(date);
+    const lunarDay = solarDay.getLunar();
+    const dayInChinese = lunarDay.getDayInChinese();
+    const lunarText = dayInChinese === '初一'
+      ? lunarDay.getMonthInChinese() + '月'
+      : dayInChinese;
+
+    const info = {
+      lunarText,
+      lunarFestivals: lunarDay.getFestivals(),
+      solarFestivals: solarDay.getFestivals(),
+      jieQi: lunarDay.getJieQi(),
+      holiday: HolidayUtil.getHoliday(date.getFullYear(), date.getMonth() + 1, date.getDate()),
+      isWeekend: date.getDay() === 0 || date.getDay() === 6
+    };
+    this.dayInfoCache.set(key, info);
+    return info;
+  }
+
+  /**
+   * 获取月份的农历标题字符串（带缓存），用于头部显示
+   */
+  getMonthLunarInfo(year, month) {
+    const key = `${year}-${month}`;
+    if (this.monthLunarCache.has(key)) {
+      return this.monthLunarCache.get(key);
+    }
+    const lunarDay = Solar.fromYmd(year, month, 1).getLunar();
+    const str = lunarDay.getYearInGanZhi() + lunarDay.getYearShengXiao() + '年 ' + lunarDay.getMonthInChinese() + '月';
+    this.monthLunarCache.set(key, str);
+    return str;
   }
 
   /**
@@ -851,6 +776,11 @@ class CalendarView extends ItemView {
 
     // 创建日历容器
     this.createCalendarView();
+
+    // 视图打开后聚焦网格，便于键盘导航
+    requestAnimationFrame(() => {
+      if (this.grid) this.grid.focus();
+    });
   }
 
   /**
@@ -983,9 +913,53 @@ class CalendarView extends ItemView {
   createGrid() {
     const grid = document.createElement('div');
     grid.className = 'calendar-grid';
+    // 使网格可聚焦，以支持键盘方向键导航日期
+    grid.tabIndex = 0;
+    grid.setAttribute('role', 'grid');
+    this.attachKeyboardNav(grid);
     return grid;
   }
 
+  /**
+   * 绑定键盘方向键导航：方向键移动选中日期，Enter 打开当天首个笔记
+   * 跨月移动时同步切换视图月份
+   */
+  attachKeyboardNav(grid) {
+    grid.addEventListener('keydown', (e) => {
+      let delta = 0;
+      switch (e.key) {
+        case 'ArrowRight': delta = 1; break;
+        case 'ArrowLeft': delta = -1; break;
+        case 'ArrowDown': delta = 7; break;
+        case 'ArrowUp': delta = -7; break;
+        case 'Enter': {
+          e.preventDefault();
+          this.openSelectedDateFirstNote();
+          return;
+        }
+        default: return;
+      }
+      e.preventDefault();
+      this.model.moveSelection(delta);
+      this.render();
+    });
+  }
+
+  /**
+   * 打开当前选中日期的第一个笔记（无笔记则无操作）
+   */
+  openSelectedDateFirstNote() {
+    const selectedDate = this.model.selectedDate;
+    if (!selectedDate) return;
+    const dateStr = this.model.formatDate(selectedDate);
+    const notes = this.model.getNotesForDate(dateStr);
+    if (notes.length === 0) return;
+    const note = notes[0];
+    const file = this.app.vault.getAbstractFileByPath(note.path);
+    if (file) {
+      this.app.workspace.getLeaf(false).openFile(file);
+    }
+  }
 
 
   /**
@@ -1021,14 +995,12 @@ class CalendarView extends ItemView {
     });
 
     // 用于跟踪当前的周数
-    let currentWeekNumber = null;
     let dayInRow = 0;
 
     // 渲染周数和日期
     calendarData.forEach((dayData) => {
-      var solarDay = Solar.fromDate(dayData.date);
-      var lunarDay = solarDay.getLunar();
-      var holiday = HolidayUtil.getHoliday(dayData.date.getFullYear(), dayData.date.getMonth() + 1, dayData.date.getDate());
+      const info = this.getDayInfo(dayData.date);
+      const holiday = info.holiday;
       if (dayData.date) {
         // 检查是否是每行的第一个日期
         if (dayInRow === 0) {
@@ -1040,7 +1012,6 @@ class CalendarView extends ItemView {
           weekNumberCell.className = 'calendar-week-number';
           weekNumberCell.textContent = weekNumber;
           this.grid.appendChild(weekNumberCell);
-          currentWeekNumber = weekNumber;
         }
 
         // 添加日期单元格
@@ -1056,7 +1027,7 @@ class CalendarView extends ItemView {
         }
 
         // 处理周末颜色逻辑 - 跟随调休状态
-        const isWeekend = dayData.date && (dayData.date.getDay() === 0 || dayData.date.getDay() === 6);
+        const isWeekend = info.isWeekend;
         const hasHoliday = holiday !== null;
 
         if (isWeekend) {
@@ -1087,20 +1058,14 @@ class CalendarView extends ItemView {
         if (this.model.showLunarDate) {
           const lunarDayText = document.createElement('div');
           lunarDayText.className = 'calendar-day-lunar';
-          const dayInChinese = lunarDay.getDayInChinese();
-          // 如果是初一，显示月份
-          if (dayInChinese === '初一') {
-            lunarDayText.textContent = lunarDay.getMonthInChinese()+"月";
-          } else {
-            lunarDayText.textContent = dayInChinese;
-          }
+          lunarDayText.textContent = info.lunarText;
           dayCell.appendChild(lunarDayText);
         }
 
 
         // 获取农历节日
         if (this.model.showLunarFestivals) {
-          const lunarFestivals = lunarDay.getFestivals();
+          const lunarFestivals = info.lunarFestivals;
           if (lunarFestivals && lunarFestivals.length > 0) {
             const lunarFestivalText = document.createElement('div');
             lunarFestivalText.className = 'calendar-day-festival';
@@ -1112,7 +1077,7 @@ class CalendarView extends ItemView {
 
         // 获取阳历节日
         if (this.model.showSolarFestivals) {
-          const solarFestivals = solarDay.getFestivals();
+          const solarFestivals = info.solarFestivals;
           if (solarFestivals && solarFestivals.length > 0) {
             const solarFestivalText = document.createElement('div');
             solarFestivalText.className = 'calendar-day-festival';
@@ -1123,7 +1088,7 @@ class CalendarView extends ItemView {
 
         // 获取节气
         if (this.model.showJieQi) {
-          const lunarJieQi = lunarDay.getJieQi();
+          const lunarJieQi = info.jieQi;
           if (lunarJieQi) {
             const lunarJieQiText = document.createElement('div');
             lunarJieQiText.className = 'calendar-day-festival';
@@ -1181,6 +1146,8 @@ class CalendarView extends ItemView {
           const day = dayData.date.getDate();
           this.model.selectDate(year, month, day);
           this.render();
+          // 点击后回焦网格，保证键盘导航仍可用
+          this.grid.focus();
         };        
 
         this.grid.appendChild(dayCell);
@@ -1196,66 +1163,36 @@ class CalendarView extends ItemView {
 
   /**
    * 创建笔记列表容器
+   * 内容由 updateNotesList 填充，这里只建空容器
    */
   createNotesList() {
     const container = document.createElement('div');
     container.className = 'calendar-notes-list';
-    
-    // 创建标题容器（包含创建按钮和日期标题）
-    const titleContainer = document.createElement('div');
-    titleContainer.className = 'calendar-notes-title-container';
-    
-    // 创建按钮组
+    return container;
+  }
+
+  /**
+   * 构建笔记创建按钮组（日记/周/季/年），供 updateNotesList 复用
+   */
+  createNoteButtons() {
     const createBtnGroup = document.createElement('div');
     createBtnGroup.className = 'calendar-create-btn-group';
-    
-    // 日记创建按钮
-    const createBtn = document.createElement('button');
-    createBtn.className = 'calendar-create-note-btn';
-    createBtn.textContent = '+';
-    createBtn.title = '创建日记';
-    createBtn.onclick = () => this.showCreateNoteDialog('daily');
-    createBtnGroup.appendChild(createBtn);
-    
-    // 周周记创建按钮
-    const createWeeklyBtn = document.createElement('button');
-    createWeeklyBtn.className = 'calendar-create-note-btn';
-    createWeeklyBtn.textContent = '周';
-    createWeeklyBtn.title = '创建周周记';
-    createWeeklyBtn.onclick = () => this.showCreateNoteDialog('weekly');
-    createBtnGroup.appendChild(createWeeklyBtn);
-    
-    // 季度笔记创建按钮
-    const createQuarterlyBtn = document.createElement('button');
-    createQuarterlyBtn.className = 'calendar-create-note-btn';
-    createQuarterlyBtn.textContent = '季';
-    createQuarterlyBtn.title = '创建季度笔记';
-    createQuarterlyBtn.onclick = () => this.showCreateNoteDialog('quarterly');
-    createBtnGroup.appendChild(createQuarterlyBtn);
-    
-    // 年度笔记创建按钮
-    const createYearlyBtn = document.createElement('button');
-    createYearlyBtn.className = 'calendar-create-note-btn';
-    createYearlyBtn.textContent = '年';
-    createYearlyBtn.title = '创建年度笔记';
-    createYearlyBtn.onclick = () => this.showCreateNoteDialog('yearly');
-    createBtnGroup.appendChild(createYearlyBtn);
-    
-    titleContainer.appendChild(createBtnGroup);
-    
-    // 创建日期标题
-    const titleEl = document.createElement('div');
-    titleEl.className = 'calendar-notes-title';
-    titleContainer.appendChild(titleEl);
-    
-    container.appendChild(titleContainer);
-    
-    // 创建笔记列表容器
-    const notesContainer = document.createElement('div');
-    notesContainer.className = 'calendar-notes-items';
-    container.appendChild(notesContainer);
-    
-    return container;
+
+    const buttons = [
+      { text: '+', title: '创建日记', type: 'daily' },
+      { text: '周', title: '创建周周记', type: 'weekly' },
+      { text: '季', title: '创建季度笔记', type: 'quarterly' },
+      { text: '年', title: '创建年度笔记', type: 'yearly' }
+    ];
+    for (const b of buttons) {
+      const btn = document.createElement('button');
+      btn.className = 'calendar-create-note-btn';
+      btn.textContent = b.text;
+      btn.title = b.title;
+      btn.onclick = () => this.showCreateNoteDialog(b.type);
+      createBtnGroup.appendChild(btn);
+    }
+    return createBtnGroup;
   }
 
   /**
@@ -1281,43 +1218,7 @@ class CalendarView extends ItemView {
     const titleContainer = document.createElement('div');
     titleContainer.className = 'calendar-notes-title-container';
     
-    // 创建按钮组
-    const createBtnGroup = document.createElement('div');
-    createBtnGroup.className = 'calendar-create-btn-group';
-    
-    // 日记创建按钮
-    const createBtn = document.createElement('button');
-    createBtn.className = 'calendar-create-note-btn';
-    createBtn.textContent = '+';
-    createBtn.title = '创建日记';
-    createBtn.onclick = () => this.showCreateNoteDialog('daily');
-    createBtnGroup.appendChild(createBtn);
-    
-    // 周周记创建按钮
-    const createWeeklyBtn = document.createElement('button');
-    createWeeklyBtn.className = 'calendar-create-note-btn';
-    createWeeklyBtn.textContent = '周';
-    createWeeklyBtn.title = '创建周周记';
-    createWeeklyBtn.onclick = () => this.showCreateNoteDialog('weekly');
-    createBtnGroup.appendChild(createWeeklyBtn);
-    
-    // 季度笔记创建按钮
-    const createQuarterlyBtn = document.createElement('button');
-    createQuarterlyBtn.className = 'calendar-create-note-btn';
-    createQuarterlyBtn.textContent = '季';
-    createQuarterlyBtn.title = '创建季度笔记';
-    createQuarterlyBtn.onclick = () => this.showCreateNoteDialog('quarterly');
-    createBtnGroup.appendChild(createQuarterlyBtn);
-    
-    // 年度笔记创建按钮
-    const createYearlyBtn = document.createElement('button');
-    createYearlyBtn.className = 'calendar-create-note-btn';
-    createYearlyBtn.textContent = '年';
-    createYearlyBtn.title = '创建年度笔记';
-    createYearlyBtn.onclick = () => this.showCreateNoteDialog('yearly');
-    createBtnGroup.appendChild(createYearlyBtn);
-    
-    titleContainer.appendChild(createBtnGroup);
+    titleContainer.appendChild(this.createNoteButtons());
     
     // 创建日期标题
     const titleEl = document.createElement('div');
@@ -1329,7 +1230,6 @@ class CalendarView extends ItemView {
 
     // 获取该日期的笔记列表
     const notes = this.model.getNotesForDate(dateStr);
-    console.log(`[NoteCalendar] 更新笔记列表，日期: ${dateStr}, 笔记数量: ${notes.length}`);
 
     // 创建笔记列表容器
     const notesContainer = document.createElement('div');
@@ -1358,7 +1258,6 @@ class CalendarView extends ItemView {
 
         // 添加点击事件
         noteItem.onclick = async () => {
-          console.log(`[NoteCalendar] 点击笔记: ${note.path}`);
           // 打开笔记文件
           const file = this.app.vault.getAbstractFileByPath(note.path);
           if (file) {
@@ -1381,18 +1280,6 @@ class CalendarView extends ItemView {
   }
 
   /**
-   * 计算周数
-   * @param {Date} date - 日期对象
-   * @returns {number} 周数（1-52/53）
-   */
-  getWeekNumber(date) {
-    const target = new Date(date.valueOf());
-    target.setDate(target.getDate() + 4 - (target.getDay() || 7));
-    const yearStart = new Date(target.getFullYear(), 0, 1);
-    return Math.ceil(((target - yearStart) / 86400000 + 1) / 7);
-  }
-
-  /**
    * 显示创建笔记对话框
    */
   showCreateNoteDialog(type = 'daily') {
@@ -1408,7 +1295,7 @@ class CalendarView extends ItemView {
     switch (type) {
       case 'weekly':
         // 计算当前周数
-        const weekNumber = this.getWeekNumber(selectedDate);
+        const weekNumber = this.model.getWeekNumber(selectedDate);
         defaultTitle = `${year}-${weekNumber}周`;
         break;
       case 'quarterly':
@@ -1436,82 +1323,58 @@ class CalendarView extends ItemView {
     
     // 创建表单
     const form = document.createElement('form');
-    form.style.display = 'flex';
-    form.style.flexDirection = 'column';
-    form.style.gap = '16px';
+    form.className = 'nc-modal-form';
     
     // 标题输入框
     const titleDiv = document.createElement('div');
-    titleDiv.style.display = 'flex';
-    titleDiv.style.flexDirection = 'column';
+    titleDiv.className = 'nc-modal-field';
     
     const titleLabel = document.createElement('label');
+    titleLabel.className = 'nc-modal-label';
     titleLabel.textContent = '笔记标题:';
-    titleLabel.style.marginBottom = '4px';
     titleDiv.appendChild(titleLabel);
     
     const titleInput = document.createElement('input');
     titleInput.type = 'text';
+    titleInput.className = 'nc-modal-input';
     titleInput.value = defaultTitle;
-    titleInput.style.padding = '8px';
-    titleInput.style.border = '1px solid var(--calendar-border)';
-    titleInput.style.borderRadius = '4px';
-    titleInput.style.backgroundColor = 'var(--calendar-bg)';
-    titleInput.style.color = 'var(--calendar-text)';
     titleDiv.appendChild(titleInput);
     form.appendChild(titleDiv);
     
     // 文件夹路径输入框
     const folderDiv = document.createElement('div');
-    folderDiv.style.display = 'flex';
-    folderDiv.style.flexDirection = 'column';
+    folderDiv.className = 'nc-modal-field';
     
     const folderLabel = document.createElement('label');
+    folderLabel.className = 'nc-modal-label';
     folderLabel.textContent = '文件夹路径:';
-    folderLabel.style.marginBottom = '4px';
     folderDiv.appendChild(folderLabel);
     
     const folderInput = document.createElement('input');
     folderInput.type = 'text';
+    folderInput.className = 'nc-modal-input';
     folderInput.placeholder = '例如: notes/日记';
     folderInput.value = this.model.defaultCreateFolder || '';
-    folderInput.style.padding = '8px';
-    folderInput.style.border = '1px solid var(--calendar-border)';
-    folderInput.style.borderRadius = '4px';
-    folderInput.style.backgroundColor = 'var(--calendar-bg)';
-    folderInput.style.color = 'var(--calendar-text)';
     folderDiv.appendChild(folderInput);
     form.appendChild(folderDiv);
     
     // 按钮容器
     const buttonContainer = document.createElement('div');
-    buttonContainer.style.display = 'flex';
-    buttonContainer.style.justifyContent = 'flex-end';
-    buttonContainer.style.gap = '8px';
+    buttonContainer.className = 'nc-modal-button-row';
     
     // 取消按钮
     const cancelBtn = document.createElement('button');
     cancelBtn.type = 'button';
+    cancelBtn.className = 'nc-modal-btn nc-modal-btn-cancel';
     cancelBtn.textContent = '取消';
-    cancelBtn.style.padding = '8px 16px';
-    cancelBtn.style.border = '1px solid var(--calendar-border)';
-    cancelBtn.style.borderRadius = '4px';
-    cancelBtn.style.backgroundColor = 'var(--calendar-bg)';
-    cancelBtn.style.color = 'var(--calendar-text)';
-    cancelBtn.style.cursor = 'pointer';
     cancelBtn.onclick = () => modal.close();
     buttonContainer.appendChild(cancelBtn);
     
     // 确认按钮
     const confirmBtn = document.createElement('button');
     confirmBtn.type = 'button';
+    confirmBtn.className = 'nc-modal-btn nc-modal-btn-confirm';
     confirmBtn.textContent = '确认';
-    confirmBtn.style.padding = '8px 16px';
-    confirmBtn.style.border = '1px solid var(--calendar-primary)';
-    confirmBtn.style.borderRadius = '4px';
-    confirmBtn.style.backgroundColor = 'var(--calendar-primary)';
-    confirmBtn.style.color = '#ffffff';
-    confirmBtn.style.cursor = 'pointer';
     confirmBtn.onclick = async () => {
       const title = titleInput.value.trim();
       const folderPath = folderInput.value.trim();
@@ -1584,8 +1447,8 @@ class CalendarView extends ItemView {
       // 自动打开新创建的笔记
       await this.app.workspace.openLinkText(file.path, '', false);
 
-      // 刷新笔记缓存
-      this.plugin.scanNotes();
+      // 增量刷新该文件的缓存（create 事件也会触发，幂等）
+      this.plugin.refreshFile(file.path);
     } catch (error) {
       console.error('[NoteCalendar] 创建笔记失败:', error);
       new Notice('创建笔记失败: ' + error.message);
@@ -1636,7 +1499,6 @@ class CalendarView extends ItemView {
       // 获取模板文件
       const templateFile = this.app.vault.getAbstractFileByPath(templatePath);
       if (!templateFile || !templateFile.extension || templateFile.extension.toLowerCase() !== 'md') {
-        console.log('[NoteCalendar] 模板文件不存在或不是markdown文件:', templatePath);
         new Notice('模板文件不存在: ' + templatePath);
         return '';
       }
@@ -1790,55 +1652,11 @@ class CalendarView extends ItemView {
       const { year, month } = this.model.getViewDate();
       this.titleEl.textContent = `${year}年 ${month}月`;
       if (this.model.showLunarDate) {
-        var lunarDay = Solar.fromYmd(year, month, 1).getLunar();
-        var str = lunarDay.getYearInGanZhi() + lunarDay.getYearShengXiao() + "年 " + lunarDay.getMonthInChinese() + "月";
-        this.lunarTitleEl.textContent = str;
-      }else{
-         this.lunarTitleEl.textContent = "";
+        this.lunarTitleEl.textContent = this.getMonthLunarInfo(year, month);
+      } else {
+        this.lunarTitleEl.textContent = "";
       }
     }
-  }
-
-  /**
-   * 创建日期单元格 
-   */
-  createDayCell(dayData) {
-    const cell = document.createElement('div');
-    cell.className = 'calendar-day';
-    cell.textContent = dayData.day;
-
-    if (!dayData.isCurrentMonth) {
-      cell.classList.add('calendar-day-other');
-    }
-
-    if (dayData.isToday) {
-      cell.classList.add('calendar-day-today');
-    }
-
-    // 如果是周六或周日，添加周末样式
-    if (dayData.date) {
-      const dayOfWeek = dayData.date.getDay();
-      const isWeekend = dayOfWeek === 0 || dayOfWeek === 6; // 0=周日, 6=周六
-      if (isWeekend) {
-        cell.classList.add('calendar-day-weekend');
-      }
-
-      // 检查是否是选中的日期
-      if (this.model.isSelectedDate(dayData.date.getFullYear(), dayData.date.getMonth() + 1, dayData.date.getDate())) {
-        cell.classList.add('calendar-day-selected');
-      }
-
-      // 添加点击事件
-      cell.onclick = () => {
-        const year = dayData.date.getFullYear();
-        const month = dayData.date.getMonth() + 1;
-        const day = dayData.date.getDate();
-        this.model.selectDate(year, month, day);
-        this.render();
-      };
-    }
-
-    return cell;
   }
 
   async onClose() {
@@ -1941,12 +1759,12 @@ class CalendarSettingTab extends PluginSettingTab {
         .setLimits(10, 20, 1)
         .setValue(this.plugin.settings.fontSize)
         .setDynamicTooltip()
-        .onChange(async (value) => {
+        .onChange(debounce(async (value) => {
           await this.plugin.updateSettings({
             fontSize: Math.round(value)
           });
-        }));
-        
+        }, 300)));
+
     new Setting(containerEl)
       .setName('是否显示公历假日')
       .setDesc('关闭后不再显示公历假日')
@@ -2010,11 +1828,11 @@ class CalendarSettingTab extends PluginSettingTab {
       .addText(text => text
         .setPlaceholder('例如: Notes')
         .setValue(this.plugin.settings.noteFolderPath)
-        .onChange(async (value) => {
+        .onChange(debounce(async (value) => {
           await this.plugin.updateSettings({
             noteFolderPath: value
           });
-        }));
+        }, 400)));
 
     // 模板文件路径设置
     new Setting(containerEl)
@@ -2023,11 +1841,11 @@ class CalendarSettingTab extends PluginSettingTab {
       .addText(text => text
         .setPlaceholder('例如: 模板/日记模板')
         .setValue(this.plugin.settings.templatePath)
-        .onChange(async (value) => {
+        .onChange(debounce(async (value) => {
           await this.plugin.updateSettings({
             templatePath: value
           });
-        }));
+        }, 400)));
 
     // 默认创建文件夹路径设置
     new Setting(containerEl)
@@ -2036,11 +1854,11 @@ class CalendarSettingTab extends PluginSettingTab {
       .addText(text => text
         .setPlaceholder('例如: 日记')
         .setValue(this.plugin.settings.defaultCreateFolder)
-        .onChange(async (value) => {
+        .onChange(debounce(async (value) => {
           await this.plugin.updateSettings({
             defaultCreateFolder: value
           });
-        }));
+        }, 400)));
 
     // 日期格式设置
     new Setting(containerEl)
