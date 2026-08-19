@@ -1197,6 +1197,10 @@ class CalendarView extends ItemView {
             // isWork()为false表示放假，显示"休"
             holidayMarker.classList.add('calendar-holiday-rest');
             holidayMarker.textContent = '休';
+            // 香港公众假期：圆圈+主题色，与大陆方框红字区分
+            if (info.hkFestival) {
+              holidayMarker.classList.add('calendar-holiday-hk');
+            }
           }
           dayCell.appendChild(holidayMarker);
         }

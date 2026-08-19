@@ -304,6 +304,19 @@
   border-color: #333333;
 }
 
+/* 香港公众假期"休"标记：正圆 + 主题色，与大陆方框红字区分 */
+.calendar-holiday-marker.calendar-holiday-hk {
+  width: calc(var(--calendar-font-size) * 1.1);
+  height: calc(var(--calendar-font-size) * 1.1);
+  padding: 0;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  border-radius: 50%;
+  color: var(--calendar-primary);
+  border-color: var(--calendar-primary);
+}
+
 /* 非当前月份的日期 */
 .calendar-day-other {
   color: var(--calendar-text-muted);
