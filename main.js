@@ -31,6 +31,66 @@ function isPathInFolder(filePath, folderPath) {
   return p === f || p.startsWith(f + '/');
 }
 
+/**
+ * 节假日数据补全
+ * lunar.js 内置的 HolidayUtil 数据仅覆盖到 2026-10。
+ * 此处通过 HolidayUtil.fix() 追加 2027 年的法定节日放假数据，
+ * 使 2027 年起日历仍能显示节日标记。
+ *
+ * 数据格式（每条 18 字符）：YYYYMMDD + 名称索引 + 休/班标志 + 目标日期YYYYMMDD
+ *   名称索引: 0=元旦节 1=春节 2=清明节 3=劳动节 4=端午节 5=中秋节 6=国庆节
+ *   休/班标志: 1=放假(休) 0=调休上班(班)
+ *   目标日期: 该日归属的节日首日
+ *
+ * 注意：调休上班日（"班"）需待国务院每年 11 月底公布具体安排后才能确定，
+ * 此处仅预填放假日期，不预填调休班日，避免误导。
+ */
+const HOLIDAY_FIX_DATA = (() => {
+  // 生成单条记录
+  const rec = (date, nameIdx, workFlag, target) =>
+    date + nameIdx + workFlag + target;
+  const parts = [];
+  // 2027 元旦（1/1-1/3 放假）
+  parts.push(rec('20270101', '0', '1', '20270101'));
+  parts.push(rec('20270102', '0', '1', '20270101'));
+  parts.push(rec('20270103', '0', '1', '20270101'));
+  // 2027 春节（正月初一 = 2027-02-06，按近年惯例放假 7 天：2/6-2/12）
+  parts.push(rec('20270206', '1', '1', '20270206'));
+  parts.push(rec('20270207', '1', '1', '20270206'));
+  parts.push(rec('20270208', '1', '1', '20270206'));
+  parts.push(rec('20270209', '1', '1', '20270206'));
+  parts.push(rec('20270210', '1', '1', '20270206'));
+  parts.push(rec('20270211', '1', '1', '20270206'));
+  parts.push(rec('20270212', '1', '1', '20270206'));
+  // 2027 清明（4/5，放假 3 天：4/5-4/7，含周末）
+  parts.push(rec('20270405', '2', '1', '20270405'));
+  parts.push(rec('20270406', '2', '1', '20270405'));
+  parts.push(rec('20270407', '2', '1', '20270405'));
+  // 2027 劳动节（5/1，放假 5 天：5/1-5/5）
+  parts.push(rec('20270501', '3', '1', '20270501'));
+  parts.push(rec('20270502', '3', '1', '20270501'));
+  parts.push(rec('20270503', '3', '1', '20270501'));
+  parts.push(rec('20270504', '3', '1', '20270501'));
+  parts.push(rec('20270505', '3', '1', '20270501'));
+  // 2027 端午（6/9，放假 3 天：6/9-6/11，含周末）
+  parts.push(rec('20270609', '4', '1', '20270609'));
+  parts.push(rec('20270610', '4', '1', '20270609'));
+  parts.push(rec('20270611', '4', '1', '20270609'));
+  // 2027 中秋（9/15，放假 3 天：9/15-9/17，含周末）
+  parts.push(rec('20270915', '5', '1', '20270915'));
+  parts.push(rec('20270916', '5', '1', '20270915'));
+  parts.push(rec('20270917', '5', '1', '20270915'));
+  // 2027 国庆（10/1，放假 7 天：10/1-10/7）
+  parts.push(rec('20271001', '6', '1', '20271001'));
+  parts.push(rec('20271002', '6', '1', '20271001'));
+  parts.push(rec('20271003', '6', '1', '20271001'));
+  parts.push(rec('20271004', '6', '1', '20271001'));
+  parts.push(rec('20271005', '6', '1', '20271001'));
+  parts.push(rec('20271006', '6', '1', '20271001'));
+  parts.push(rec('20271007', '6', '1', '20271001'));
+  return parts.join('');
+})();
+
 // 默认设置
 const DEFAULT_SETTINGS = {
   startOfWeek: 0, // 0=周日, 1=周一
@@ -398,6 +458,9 @@ module.exports = class NoteCalendarPlugin extends Plugin {
     Lunar = lunarModule.Lunar;
     Solar = lunarModule.Solar;
     HolidayUtil = lunarModule.HolidayUtil;
+
+    // 追加 2027 年节假日数据（lunar.js 内置数据仅覆盖到 2026-10）
+    HolidayUtil.fix(HOLIDAY_FIX_DATA);
 
     // 加载设置
     await this.loadSettings();
