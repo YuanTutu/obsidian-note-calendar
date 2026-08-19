@@ -60,6 +60,38 @@ const HOLIDAY_FIX_DATA = (() => {
   ].join('');
 })();
 
+/**
+ * 香港公众假期表：日期字符串 -> 假期名称
+ * 数据来源：香港政府宪报公告（gov.hk/tc/about/abouthk/holiday）
+ * 与大陆节假日独立维护，由"显示香港公众假期"开关控制。
+ * 香港假期均为放假（无调休上班），标记一律为"休"。
+ * 每年港府公布次年安排后在此追加。
+ */
+const HK_HOLIDAYS = {
+  // 2026 年剩余（宪报已公布）
+  '2026-10-19': '重阳节翌日',
+  '2026-12-25': '圣诞节',
+  '2026-12-26': '圣诞节后第一个周日',
+  // 2027 年（2026-05-15 宪报公布）
+  '2027-01-01': '一月一日',
+  '2027-02-06': '农历年初一',
+  '2027-02-08': '农历年初三',
+  '2027-02-09': '农历年初四',
+  '2027-03-26': '耶稣受难节',
+  '2027-03-27': '耶稣受难节翌日',
+  '2027-03-29': '复活节星期一',
+  '2027-04-05': '清明节',
+  '2027-05-01': '劳动节',
+  '2027-05-13': '佛诞',
+  '2027-06-09': '端午节',
+  '2027-07-01': '香港特区成立纪念日',
+  '2027-09-16': '中秋节翌日',
+  '2027-10-01': '国庆日',
+  '2027-10-08': '重阳节',
+  '2027-12-25': '圣诞节',
+  '2027-12-26': '圣诞节后第一个周日'
+};
+
 // 默认设置
 const DEFAULT_SETTINGS = {
   startOfWeek: 0, // 0=周日, 1=周一
@@ -71,6 +103,7 @@ const DEFAULT_SETTINGS = {
   showLunarFestivals: true, // 是否显示农历节日
   showHolidayMarker: true, // 是否显示调休
   showJieQi: true, // 是否显示节气
+  showHongKongHolidays: false, // 是否显示香港公众假期
   noteFolderPath: '', // 笔记文件夹路径，默认为空（根目录）
   dateFormat: 'YYYY-MM-DD', // 日期格式，默认为YYYY-MM-DD
   templatePath: '', // 日记模板文件路径，留空则尝试读取核心"日记"插件的模板设置
@@ -96,6 +129,7 @@ class CalendarModel {
     this.showLunarFestivals = settings.showLunarFestivals !== undefined ? settings.showLunarFestivals : true; // 是否显示农历节日
     this.showHolidayMarker = settings.showHolidayMarker !== undefined ? settings.showHolidayMarker : true; // 是否显示调休
     this.showJieQi = settings.showJieQi !== undefined ? settings.showJieQi : true; // 是否显示节气
+    this.showHongKongHolidays = settings.showHongKongHolidays !== undefined ? settings.showHongKongHolidays : false; // 是否显示香港公众假期
     this.noteFolderPath = settings.noteFolderPath || ''; // 笔记文件夹路径
     this.dateFormat = settings.dateFormat || 'YYYY-MM-DD'; // 日期格式
     this.templatePath = settings.templatePath || ''; // 模板文件路径
@@ -537,6 +571,7 @@ module.exports = class NoteCalendarPlugin extends Plugin {
         view.model.showLunarFestivals = this.settings.showLunarFestivals;
         view.model.showJieQi = this.settings.showJieQi;
         view.model.showHolidayMarker = this.settings.showHolidayMarker;
+        view.model.showHongKongHolidays = this.settings.showHongKongHolidays;
         view.model.noteFolderPath = this.settings.noteFolderPath;
         view.model.dateFormat = this.settings.dateFormat;
         view.model.templatePath = this.settings.templatePath;
@@ -740,7 +775,8 @@ class CalendarView extends ItemView {
    * lunar.js 的相关方法均为纯函数，结果按日期缓存，软上限 2000 条
    */
   getDayInfo(date) {
-    const key = this.model.formatDate(date);
+    // 缓存 key 纳入香港假期开关状态，切换开关后自动重新计算
+    const key = this.model.formatDate(date) + (this.model.showHongKongHolidays ? '|hk' : '');
     if (this.dayInfoCache.has(key)) {
       return this.dayInfoCache.get(key);
     }
@@ -761,8 +797,19 @@ class CalendarView extends ItemView {
       solarFestivals: solarDay.getFestivals(),
       jieQi: lunarDay.getJieQi(),
       holiday: HolidayUtil.getHoliday(date.getFullYear(), date.getMonth() + 1, date.getDate()),
+      hkFestival: null,
       isWeekend: date.getDay() === 0 || date.getDay() === 6
     };
+
+    // 香港公众假期：覆盖 holiday 使其显示"休"标记，并记录假期名
+    if (this.model.showHongKongHolidays) {
+      const hkName = HK_HOLIDAYS[this.model.formatDate(date)];
+      if (hkName) {
+        info.hkFestival = hkName;
+        info.holiday = { isWork: () => false, getName: () => hkName };
+      }
+    }
+
     this.dayInfoCache.set(key, info);
     return info;
   }
@@ -1095,37 +1142,46 @@ class CalendarView extends ItemView {
         }
 
 
-        // 获取农历节日
-        if (this.model.showLunarFestivals) {
-          const lunarFestivals = info.lunarFestivals;
-          if (lunarFestivals && lunarFestivals.length > 0) {
-            const lunarFestivalText = document.createElement('div');
-            lunarFestivalText.className = 'calendar-day-festival';
-            lunarFestivalText.textContent = lunarFestivals[0];
-            dayCell.appendChild(lunarFestivalText);
+        // 节日文本：香港假期名优先（开关开启且当天为香港假期时，
+        // 只显示香港名称，跳过农历/阳历节日与节气文本，避免同一天多行重复）
+        if (info.hkFestival) {
+          const hkText = document.createElement('div');
+          hkText.className = 'calendar-day-festival';
+          hkText.textContent = info.hkFestival;
+          dayCell.appendChild(hkText);
+        } else {
+          // 获取农历节日
+          if (this.model.showLunarFestivals) {
+            const lunarFestivals = info.lunarFestivals;
+            if (lunarFestivals && lunarFestivals.length > 0) {
+              const lunarFestivalText = document.createElement('div');
+              lunarFestivalText.className = 'calendar-day-festival';
+              lunarFestivalText.textContent = lunarFestivals[0];
+              dayCell.appendChild(lunarFestivalText);
+            }
           }
-        }
 
 
-        // 获取阳历节日
-        if (this.model.showSolarFestivals) {
-          const solarFestivals = info.solarFestivals;
-          if (solarFestivals && solarFestivals.length > 0) {
-            const solarFestivalText = document.createElement('div');
-            solarFestivalText.className = 'calendar-day-festival';
-            solarFestivalText.textContent = solarFestivals[0];
-            dayCell.appendChild(solarFestivalText);
+          // 获取阳历节日
+          if (this.model.showSolarFestivals) {
+            const solarFestivals = info.solarFestivals;
+            if (solarFestivals && solarFestivals.length > 0) {
+              const solarFestivalText = document.createElement('div');
+              solarFestivalText.className = 'calendar-day-festival';
+              solarFestivalText.textContent = solarFestivals[0];
+              dayCell.appendChild(solarFestivalText);
+            }
           }
-        }
 
-        // 获取节气
-        if (this.model.showJieQi) {
-          const lunarJieQi = info.jieQi;
-          if (lunarJieQi) {
-            const lunarJieQiText = document.createElement('div');
-            lunarJieQiText.className = 'calendar-day-festival';
-            lunarJieQiText.textContent = lunarJieQi;
-            dayCell.appendChild(lunarJieQiText);
+          // 获取节气
+          if (this.model.showJieQi) {
+            const lunarJieQi = info.jieQi;
+            if (lunarJieQi) {
+              const lunarJieQiText = document.createElement('div');
+              lunarJieQiText.className = 'calendar-day-festival';
+              lunarJieQiText.textContent = lunarJieQi;
+              dayCell.appendChild(lunarJieQiText);
+            }
           }
         }
 
@@ -1849,6 +1905,17 @@ class CalendarSettingTab extends PluginSettingTab {
           .onChange(async (value) => {
             await this.plugin.updateSettings({
               showJieQi: value
+            });
+          });
+      });
+      new Setting(containerEl)
+      .setName('显示香港公众假期')
+      .setDesc('开启后显示香港公众假期（2026-2027，含耶稣受难节、复活节、佛诞、重阳节等）。数据来自香港政府宪报公告，每年公布后需更新插件')
+      .addToggle((toggle) => {
+        toggle.setValue(this.plugin.settings.showHongKongHolidays)
+          .onChange(async (value) => {
+            await this.plugin.updateSettings({
+              showHongKongHolidays: value
             });
           });
       });
